@@ -1,0 +1,23 @@
+name: Database Maintenance
+
+on:
+  schedule:
+    # Every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    name: Expire old articles
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Deactivate expired articles
+        run: |
+          echo "Running DB cleanup at $(date -u)"
+          curl -s -f -X POST \
+            "${{ secrets.APP_URL }}/api/maintenance/cleanup" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json"
+          echo "✅ Cleanup complete"
