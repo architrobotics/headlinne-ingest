@@ -2,8 +2,22 @@ name: Database Maintenance
 
 on:
   schedule:
-    # Every 6 hours
-    - cron: '0 */6 * * *'
+    # Hourly at :20, NOT every 6 hours.
+    #
+    # The sweeps are bounded per run (500 rows each — see migration 055), so
+    # cadence is what provides capacity: 12,000 rows/day against a steady-state
+    # need of ~2,000. Six-hourly with a bound this small could not keep up.
+    #
+    # Small-and-frequent also beats large-and-rare on this table. Every row
+    # rewritten leaves a dead entry in three partial `is_active` indexes, and
+    # bulk-updating thousands in one go degrades read latency until autovacuum
+    # catches up (measured 2026-08-17: a feed-shaped query went to 4.9s after
+    # ~900 rows were rewritten in a tight loop). Hourly batches give autovacuum
+    # an hour to keep pace.
+    #
+    # :20 deliberately avoids ingest.yml at :07 and :37 — concurrent bulk writes
+    # on `articles` contend for the same indexes.
+    - cron: '20 * * * *'
   workflow_dispatch:
 
 jobs:
