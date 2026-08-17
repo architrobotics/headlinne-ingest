@@ -20,6 +20,24 @@ on:
     - cron: '20 * * * *'
   workflow_dispatch:
 
+  # External trigger, mirroring ingest.yml's `external-cron`. GitHub disables
+  # scheduled workflows after 60 days of repo inactivity — which is what killed
+  # ingestion 2026-08-12 to 2026-08-16 — and even when enabled the schedule is
+  # best-effort and often runs late. cron-job.org fires this instead, so the
+  # sweep does not depend on GitHub's scheduler being awake.
+  repository_dispatch:
+    types: [maintenance-cron]
+
+# Two independent triggers can now fire this, so make sure they never overlap.
+# Concurrent runs are not dangerous — the sweeps are bounded and idempotent, and
+# a second run would block on row locks and then find those rows no longer match
+# — but they would contend for the same indexes on `articles` for no benefit.
+# Queue instead of cancelling: a cancelled run's UPDATE rolls back and makes no
+# progress, so finishing the one in flight is always better.
+concurrency:
+  group: db-maintenance
+  cancel-in-progress: false
+
 jobs:
   cleanup:
     name: Expire old articles
