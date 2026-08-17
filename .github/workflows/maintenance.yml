@@ -15,9 +15,46 @@ jobs:
     steps:
       - name: Deactivate expired articles
         run: |
+          # Strip any trailing slash from APP_URL. A double slash is survivable
+          # (Vercel 308s //api/... to /api/...) but costs -L an extra round trip
+          # on every run. Mirrors ingest.yml.
+          APP_URL="${{ secrets.APP_URL }}"
+          APP_URL="${APP_URL%/}"
+
           echo "Running DB cleanup at $(date -u)"
-          curl -s -f -X POST \
-            "${{ secrets.APP_URL }}/api/maintenance/cleanup" \
+          echo "Endpoint: ${APP_URL}/api/maintenance/cleanup"
+
+          # Deliberately NOT `curl -f`. --fail exits 22 and prints nothing,
+          # which is exactly how this job failed on 2026-08-17: the log showed
+          # an exit code and no way to tell a 401 from a 504 from a 500. Capture
+          # the status and the body, print both, then decide.
+          #
+          # -L matters: the apex host 308-redirects to www, so without it curl
+          # treats the 308 as a successful response and never calls the endpoint.
+          #
+          # --max-time 120 is deliberately longer than the route's
+          # maxDuration = 60, so that if the function does time out we receive
+          # and log Vercel's 504 instead of curl aborting first and hiding it.
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -L \
+            "${APP_URL}/api/maintenance/cleanup" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            -H "Content-Type: application/json"
+            -H "Content-Type: application/json" \
+            --max-time 120)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          # The route returns 500 with a `failures` array when any individual
+          # step fails, so this catches a partial sweep too — it used to answer
+          # 200 even when every step had errored.
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Cleanup failed with status $HTTP_CODE"
+            exit 1
+          fi
+
           echo "✅ Cleanup complete"
