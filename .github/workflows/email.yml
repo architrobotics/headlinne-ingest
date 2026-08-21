@@ -1,0 +1,124 @@
+# ============================================================
+# DEAD COPY. Editing this file changes nothing in production.
+#
+# The scheduled jobs that actually run live in a SEPARATE public
+# actions repo — see docs/actions-repo/README.md. This copy exists
+# only so the workflow is reviewable alongside the code it calls.
+# The live copy is docs/actions-repo/email.yml, which must be placed
+# on the actions repo's DEFAULT branch (repository_dispatch only ever
+# triggers workflows there).
+#
+# Setup for the cron-job.org ping: docs/actions-repo/email-cron.md
+# ============================================================
+
+name: Email Dispatch
+
+on:
+  schedule:
+    # Hourly at :45.
+    #
+    # Hourly because delivery is scheduled to each user's LOCAL send hour
+    # (user_email_preferences.send_hour_local). A run every 6 hours would
+    # mean a briefing aimed at 8am arrives at 12pm for most of the user
+    # base, and the whole point of a per-user send hour is that it lands
+    # when they actually read.
+    #
+    # Hourly is NOT hourly email. The queue's monthly cap (4) and cadence
+    # floor (5 days) are what bound volume; this cadence only bounds
+    # LATENCY. Most runs plan nothing and lease nothing, because
+    # get_email_candidates excludes everyone inside their gap.
+    #
+    # :45 deliberately avoids ingest.yml at :07/:37 and maintenance.yml
+    # at :20 — the planner reads `articles` while ingestion bulk-writes
+    # it, and there is no reason to make them contend.
+    - cron: '45 * * * *'
+  workflow_dispatch:
+
+  # External trigger, mirroring ingest.yml and maintenance.yml. GitHub
+  # disables scheduled workflows after 60 days of repo inactivity — which
+  # is exactly what silently killed ingestion for six days in August 2026
+  # — and even when enabled the schedule is best-effort and often late.
+  # cron-job.org fires this so email does not depend on GitHub's
+  # scheduler being awake.
+  repository_dispatch:
+    types: [email-cron]
+
+# Two triggers can fire this, so make sure they never overlap.
+# Concurrent runs are not dangerous — claim_email_batch uses FOR UPDATE
+# SKIP LOCKED, so two dispatchers lease disjoint rows, and
+# enqueue_email's unique idempotency_key makes double-planning a no-op —
+# but they would both spend from the same daily budget with no
+# coordination, which is how a free-plan quota gets burned in one hour.
+#
+# Queue rather than cancel: a cancelled run leaves rows in 'processing'
+# that then wait 15 minutes for the stale-lease reclaim before anyone can
+# touch them again.
+concurrency:
+  group: email-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Plan and send queued email
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Plan and dispatch
+        run: |
+          # Strip any trailing slash from APP_URL. A double slash is
+          # survivable (Vercel 308s //api/... to /api/...) but costs -L an
+          # extra round trip on every run. Mirrors ingest.yml.
+          APP_URL="${{ secrets.APP_URL }}"
+          APP_URL="${APP_URL%/}"
+
+          echo "Running email dispatch at $(date -u)"
+          echo "Endpoint: ${APP_URL}/api/email/cron"
+
+          # Deliberately NOT `curl -f`. --fail exits 22 and prints
+          # nothing, which is exactly how the maintenance job failed
+          # invisibly on 2026-08-17: an exit code and no way to tell a 401
+          # from a 504 from a 500. Capture status and body, print both,
+          # then decide.
+          #
+          # -L matters: the apex host 308-redirects to www, so without it
+          # curl treats the 308 as a successful response and never calls
+          # the endpoint at all.
+          #
+          # --max-time 120 is deliberately longer than the route's
+          # maxDuration = 60, so a function timeout surfaces as Vercel's
+          # logged 504 rather than curl aborting first and hiding it.
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -L \
+            "${APP_URL}/api/email/cron" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --max-time 120)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          # 503 means RESEND_API_KEY is not configured. That is a real
+          # problem — email is silently not being sent — but it is a
+          # deployment state, not a failing run, and turning the job red
+          # every hour until someone sets a secret trains people to
+          # ignore the red. Warn loudly, exit clean.
+          if [ "$HTTP_CODE" -eq 503 ]; then
+            echo "::warning::Email is not configured (503) — no mail is being sent"
+            exit 0
+          fi
+
+          # The route returns 500 with a `failures` array if ANY step
+          # failed, including per-user planning errors. A partial failure
+          # is a failure: rows that quietly stop being planned look
+          # identical to a healthy quiet week.
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Email dispatch failed with status $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Email dispatch complete"
