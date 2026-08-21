@@ -1,0 +1,108 @@
+name: Ingestion Watchdog
+
+# ⚠ THIS FILE DOES NOT BELONG IN THE HEADLINNE APP REPO.
+# Copy it to the separate public actions repo as
+# `.github/workflows/supply-watchdog.yml`, alongside ingest.yml and
+# maintenance.yml. See README.md in this directory for the full setup.
+#
+# ── What it is for ────────────────────────────────────────────
+# Ingestion stopped dead from mid-day 2026-08-12 to 08-16 — ZERO rows created on
+# 08-13, 08-14 and 08-15, ~9,700 articles never ingested — and nothing noticed
+# for three and a half days. Cause, since confirmed: GitHub auto-disables
+# scheduled workflows after 60 days of inactivity in the repository that holds
+# them, and a repo whose only job is holding workflows is exactly the kind that
+# goes quiet.
+#
+# Nothing detected it because every signal lived inside the failing system. A
+# workflow that never fires emits no failure, sends no email and leaves no red
+# mark. Ingestion's health was therefore only observable from OUTSIDE it — by
+# asking the database what actually arrived. That is all this does.
+#
+# ── The honest caveat ─────────────────────────────────────────
+# This watchdog is itself a GitHub Actions workflow in the same repo, so the
+# 60-day rule can disable ITS schedule too. What keeps it alive is the
+# `repository_dispatch` trigger below: cron-job.org pings the GitHub API on a
+# schedule that GitHub does not own, so the run happens even when GitHub's
+# scheduler is asleep. Keep BOTH triggers — the cron is the convenience, the
+# dispatch is the guarantee.
+#
+# If you want a detector that survives GitHub being the problem entirely, add a
+# second cron-job.org job that calls the /api/maintenance/supply-check endpoint
+# directly with notify-on-failure. It is the same URL and secret; it just skips
+# this workflow. README.md covers it.
+
+on:
+  schedule:
+    # :50 deliberately avoids ingest.yml at :07/:37 and maintenance.yml at :20,
+    # and sits late in the hour so it judges an hour that has already had both
+    # of its ingestion cycles.
+    - cron: '50 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [watchdog-cron]
+
+# A queued second run would only re-read the same counters. Never cancel: a
+# cancelled watchdog is an unobserved hour.
+concurrency:
+  group: ingestion-watchdog
+  cancel-in-progress: false
+
+jobs:
+  supply:
+    name: Check ingestion supply
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Query supply health
+        run: |
+          # Strip any trailing slash from APP_URL. Mirrors ingest.yml.
+          APP_URL="${{ secrets.APP_URL }}"
+          APP_URL="${APP_URL%/}"
+
+          echo "Checking ingestion supply at $(date -u)"
+          echo "Endpoint: ${APP_URL}/api/maintenance/supply-check"
+
+          # -L matters: the apex host 308-redirects to www, so without it curl
+          # treats the redirect as the response and never reaches the endpoint.
+          #
+          # --max-time 90 is deliberately longer than the route's
+          # maxDuration = 60, so a function timeout comes back as Vercel's 504
+          # instead of curl aborting first and hiding it. Both lessons are
+          # already carried by maintenance.yml.
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -L \
+            "${APP_URL}/api/maintenance/supply-check" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --max-time 90)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Ingestion supply is healthy"
+            exit 0
+          fi
+
+          echo "❌ Ingestion supply check failed (HTTP $HTTP_CODE)"
+          echo ""
+          echo "What the codes mean:"
+          echo "  503 — real alert: ingestion has stalled or is degraded."
+          echo "        The 'problems' array in the body above says which."
+          echo "  401 — CRON_SECRET drifted between this repo and Vercel."
+          echo "  500 — the check itself could not read the database."
+          echo "  504 — the route exceeded its own 60s budget."
+          echo ""
+          echo "Runbook for a 503:"
+          echo "  1. Actions tab → Article Ingestion. ZERO runs and RED runs are"
+          echo "     different problems. Zero runs is the 2026-08-12 failure."
+          echo "  2. If zero: check for GitHub's 'scheduled workflow disabled"
+          echo "     after 60 days of inactivity' banner and email. Re-enable,"
+          echo "     then push something to this repo to reset the timer."
+          echo "  3. If red: read the ingest run log — it prints status + body."
+          exit 1
