@@ -38,6 +38,15 @@ on:
     # of its ingestion cycles.
     - cron: '50 * * * *'
   workflow_dispatch:
+    inputs:
+      simulate:
+        description: 'Drill: force the alarm to prove notifications actually arrive'
+        type: choice
+        default: ''
+        options:
+          - ''
+          - stalled
+          - degraded
   repository_dispatch:
     types: [watchdog-cron]
 
@@ -61,7 +70,25 @@ jobs:
           APP_URL="${APP_URL%/}"
 
           echo "Checking ingestion supply at $(date -u)"
-          echo "Endpoint: ${APP_URL}/api/maintenance/supply-check"
+
+          URL="${APP_URL}/api/maintenance/supply-check"
+
+          # Drill mode. `inputs` only exists on workflow_dispatch, so this is
+          # empty for the hourly schedule and for cron-job.org's ping — a drill
+          # can only ever be started by a human choosing it from the Run
+          # workflow menu.
+          #
+          # The point of it: every other part of this system can be verified,
+          # but "a 503 reaches Archit's inbox" cannot be, without making one
+          # happen. An alert nobody has watched fire is an assumption.
+          SIMULATE="${{ github.event.inputs.simulate }}"
+          if [ -n "$SIMULATE" ]; then
+            URL="${URL}?simulate=${SIMULATE}"
+            echo "⚠  DRILL: forcing a '${SIMULATE}' alarm."
+            echo "⚠  This run SHOULD fail. It is a test, not a real outage."
+          fi
+
+          echo "Endpoint: ${URL}"
 
           # -L matters: the apex host 308-redirects to www, so without it curl
           # treats the redirect as the response and never reaches the endpoint.
@@ -73,7 +100,7 @@ jobs:
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST \
             -L \
-            "${APP_URL}/api/maintenance/supply-check" \
+            "${URL}" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
             --max-time 90)
