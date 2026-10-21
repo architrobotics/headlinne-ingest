@@ -1,0 +1,53 @@
+name: Story Pages
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [stories-cron]
+
+concurrency:
+  group: story-pages
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Write story pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Generate story pages
+        run: |
+          APP_URL="${{ secrets.APP_URL }}"
+          APP_URL="${APP_URL%/}"
+
+          echo "Running story generation at $(date -u)"
+          echo "Endpoint: ${APP_URL}/api/stories/cron"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -L \
+            "${APP_URL}/api/stories/cron" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --max-time 330)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -eq 503 ]; then
+            echo "::warning::Story generation is not configured (503)"
+            exit 0
+          fi
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Story generation failed with status $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Story generation complete"
